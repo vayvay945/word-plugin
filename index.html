@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Word по шаблону</title>
+<style>
+  :root { --bg:#fff; --fg:#1f2329; --muted:#646a73; --line:#dee0e3; --accent:#3370ff; --ok:#2ea121; --err:#d83931; --soft:#f5f6f7; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1b1b1b; --fg:#ebebeb; --muted:#a6a6a6; --line:#3a3a3a; --soft:#262626; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  h1 { font-size:16px; margin:0 0 14px; }
+  section { margin-bottom:14px; }
+  .label { font-size:12px; color:var(--muted); margin-bottom:4px; }
+  select, button { width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit; }
+  button.primary { background:var(--accent); color:#fff; border:none; font-weight:600; cursor:pointer; }
+  button.primary:disabled { opacity:.5; cursor:default; }
+  button.secondary { margin-top:8px; cursor:pointer; }
+  .box { padding:8px 10px; background:var(--soft); border-radius:6px; }
+  .file { display:block; margin-top:6px; font-size:12px; color:var(--muted); }
+  #status { margin-top:10px; font-size:13px; white-space:pre-wrap; }
+  #status.ok { color:var(--ok); } #status.err { color:var(--err); }
+  details { margin-top:18px; } summary { cursor:pointer; color:var(--muted); }
+  .tag { display:inline-block; margin:4px 4px 0 0; padding:2px 6px; border:1px solid var(--line); border-radius:4px; font-family:monospace; font-size:12px; cursor:pointer; user-select:all; }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>Документ Word по шаблону</h1>
+
+<section>
+  <div class="label">Запись</div>
+  <div id="recordInfo" class="box">Выберите строку в таблице</div>
+</section>
+
+<section>
+  <div class="label">Шаблон</div>
+  <select id="tplSelect"><option value="">— загрузка… —</option></select>
+  <label class="file">или взять файл с компьютера: <input type="file" id="tplFile" accept=".docx"></label>
+</section>
+
+<section>
+  <div class="label">Куда сохранить готовый документ</div>
+  <select id="outField"></select>
+  <div class="hint">Файл запишется в выбранное поле-вложение этой записи (заменит то, что там лежит).</div>
+</section>
+
+<button id="gen" class="primary" disabled>Сформировать</button>
+<button id="dl" class="secondary" hidden>Скачать последний документ</button>
+<div id="status"></div>
+
+<details>
+  <summary>Метки для шаблона (нажмите, чтобы скопировать)</summary>
+  <div class="hint">Вставьте метку в Word вместо значения. Регистр и пробелы — как в названии поля.</div>
+  <div id="tags"></div>
+</details>
+
+<script type="module">
+import { bitable, FieldType } from 'https://esm.sh/@lark-base-open/js-sdk';
+import PizZip from 'https://esm.sh/pizzip@3';
+import Docxtemplater from 'https://esm.sh/docxtemplater@3';
+
+const $ = id => document.getElementById(id);
+const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const TEMPLATE_TABLE_NAMES = ['templates', 'шаблоны'];
+
+let state = { table: null, tableId: null, recordId: null, metas: [], templates: [], lastBlob: null, lastName: '' };
+
+function setStatus(text, cls = '') { const s = $('status'); s.textContent = text; s.className = cls; }
+
+// ---------- шаблоны из таблицы «Templates» ----------
+async function loadTemplates() {
+  const sel = $('tplSelect');
+  state.templates = [];
+  try {
+    const metaList = await bitable.base.getTableMetaList();
+    const tMeta = metaList.find(t => TEMPLATE_TABLE_NAMES.includes(t.name.trim().toLowerCase()));
+    if (tMeta) {
+      const tbl = await bitable.base.getTableById(tMeta.id);
+      const fields = await tbl.getFieldMetaList();
+      const att = fields.find(f => f.type === FieldType.Attachment);
+      const nameF = fields.find(f => f.isPrimary) || fields[0];
+      if (att) {
+        const ids = await tbl.getRecordIdList();
+        for (const rid of ids) {
+          const name = (await tbl.getCellString(nameF.id, rid)) || 'Без названия';
+          const files = (await tbl.getCellValue(att.id, rid)) || [];
+          files.forEach((f, i) => {
+            if (/\.docx$/i.test(f.name)) state.templates.push({
+              label: files.length > 1 ? `${name} — ${f.name}` : name,
+              tableId: tMeta.id, fieldId: att.id, recordId: rid, index: i, shortName: name,
+            });
+          });
+        }
+      }
+    }
+  } catch (e) { console.error(e); }
+
+  sel.innerHTML = '';
+  if (!state.templates.length) {
+    sel.innerHTML = '<option value="">Таблица «Templates» не найдена — загрузите файл ниже</option>';
+  } else {
+    state.templates.forEach((t, i) => sel.add(new Option(t.label, String(i))));
+  }
+  updateButton();
+}
+
+async function getTemplateBuffer() {
+  const file = $('tplFile').files[0];
+  if (file) return { buf: await file.arrayBuffer(), name: file.name.replace(/\.docx$/i, '') };
+  const t = state.templates[Number($('tplSelect').value)];
+  if (!t) throw new Error('Выберите шаблон');
+  const tbl = await bitable.base.getTableById(t.tableId);
+  const field = await tbl.getField(t.fieldId);
+  const urls = await field.getAttachmentUrls(t.recordId);
+  const res = await fetch(urls[t.index]);
+  if (!res.ok) throw new Error('Не удалось скачать шаблон (' + res.status + ')');
+  return { buf: await res.arrayBuffer(), name: t.shortName };
+}
+
+// ---------- текущая таблица и запись ----------
+async function onSelection(sel) {
+  if (!sel || !sel.tableId) return;
+  if (sel.tableId !== state.tableId) {
+    state.tableId = sel.tableId;
+    state.table = await bitable.base.getTableById(sel.tableId);
+    state.metas = await state.table.getFieldMetaList();
+    renderOutFields();
+    renderTags();
+  }
+  state.recordId = sel.recordId || null;
+  await renderRecord();
+  updateButton();
+}
+
+async function renderRecord() {
+  const box = $('recordInfo');
+  if (!state.recordId) { box.textContent = 'Выберите строку в таблице'; return; }
+  const primary = state.metas.find(m => m.isPrimary) || state.metas[0];
+  const v = await state.table.getCellString(primary.id, state.recordId);
+  box.textContent = v || '(пустое основное поле)';
+}
+
+function renderOutFields() {
+  const sel = $('outField');
+  sel.innerHTML = '';
+  const atts = state.metas.filter(m => m.type === FieldType.Attachment);
+  atts.forEach(m => sel.add(new Option(m.name, m.id)));
+  sel.add(new Option('Не сохранять в таблицу — только скачать', ''));
+  const pref = atts.find(m => /doc|документ/i.test(m.name));
+  if (pref) sel.value = pref.id;
+}
+
+function renderTags() {
+  const box = $('tags');
+  box.innerHTML = '';
+  const names = state.metas.filter(m => m.type !== FieldType.Attachment).map(m => m.name).concat(['Сегодня']);
+  names.forEach(n => {
+    const s = document.createElement('span');
+    s.className = 'tag'; s.textContent = `{${n}}`;
+    s.onclick = async () => { try { await navigator.clipboard.writeText(s.textContent); setStatus('Скопировано: ' + s.textContent, 'ok'); } catch {} };
+    box.appendChild(s);
+  });
+}
+
+function updateButton() {
+  const hasTpl = $('tplFile').files.length > 0 || $('tplSelect').value !== '';
+  $('gen').disabled = !(state.recordId && hasTpl);
+}
+
+// ---------- генерация ----------
+async function collectData() {
+  const data = {};
+  for (const m of state.metas) {
+    if (m.type === FieldType.Attachment) continue;
+    try { data[m.name] = (await state.table.getCellString(m.id, state.recordId)) ?? ''; }
+    catch { data[m.name] = ''; }
+  }
+  data['Сегодня'] = new Date().toLocaleDateString('ru-RU');
+  return data;
+}
+
+function explain(err) {
+  const list = err?.properties?.errors;
+  if (list?.length) return list.map(e => '• ' + (e.properties?.explanation || e.message)).join('\n');
+  return err?.message || String(err);
+}
+
+async function generate() {
+  $('gen').disabled = true;
+  setStatus('Формирую документ…');
+  try {
+    const { buf, name } = await getTemplateBuffer();
+    const data = await collectData();
+
+    const doc = new Docxtemplater(new PizZip(buf), {
+      paragraphLoop: true, linebreaks: true, nullGetter: () => '',
+    });
+    doc.render(data);
+    const blob = doc.getZip().generate({ type: 'blob', mimeType: DOCX });
+
+    const primary = state.metas.find(m => m.isPrimary) || state.metas[0];
+    const recName = data[primary.name] || 'запись';
+    const fileName = `${name} — ${recName}`.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 150) + '.docx';
+    state.lastBlob = blob; state.lastName = fileName;
+    $('dl').hidden = false;
+
+    const outId = $('outField').value;
+    if (outId) {
+      const field = await state.table.getField(outId);
+      await field.setValue(state.recordId, new File([blob], fileName, { type: DOCX }));
+      setStatus('Готово: «' + fileName + '» сохранён в запись.', 'ok');
+    } else {
+      download();
+      setStatus('Готово: «' + fileName + '».', 'ok');
+    }
+  } catch (e) {
+    console.error(e);
+    setStatus('Ошибка:\n' + explain(e), 'err');
+  } finally { updateButton(); }
+}
+
+function download() {
+  if (!state.lastBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(state.lastBlob);
+  a.download = state.lastName;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+// ---------- старт ----------
+$('gen').onclick = generate;
+$('dl').onclick = download;
+$('tplSelect').onchange = updateButton;
+$('tplFile').onchange = updateButton;
+
+(async () => {
+  try {
+    await onSelection(await bitable.base.getSelection());
+    bitable.base.onSelectionChange(({ data }) => onSelection(data));
+    await loadTemplates();
+  } catch (e) {
+    console.error(e);
+    setStatus('Плагин нужно открыть внутри Base (Lark/Feishu).\n' + explain(e), 'err');
+  }
+})();
+</script>
+</body>
+</html>
